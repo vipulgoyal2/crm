@@ -1,0 +1,45 @@
+{
+  "summary": "Iteration 6 (multi-item orders + click-to-send WhatsApp). Backend: 23/23 pytest cases pass against the public preview URL — the original 18 regression tests PLUS 5 new tests covering multi-item GST math (subtotal 3547, tax 404.59, total 4031.59, pending 3031.59, Partially Paid), legacy single-item POST still works, 400 on empty items/product, 400/404 on invalid product_id, GET order_detail joins customer phone+email on legacy orders, and customer.spent incremented by grand total (not just first item). Frontend: all critical new flows pass against the public URL — NewOrderForm validation (no customer / no product), live order-form-totals, two-item order creation with Ananya Iyer + FRAME-001 (qty 2 disc 50 tax 18) + GIFT-022 (qty 1 tax 5) + shipping 80 + paid 1000 produces the expected ₹3,547 / ₹80 / ₹405 / ₹4,032 totals, new PB-2026-00XX row appears on top with '2 items · Classic Photo Frame…' summary, OrderDetail renders both item rows with per-line price/discount/GST, order-grand-total matches, whatsapp-notify-button is enabled and opens the correct wa.me/919988776655?text=… URL containing order id and 'Paperbow', status→Shipped auto-opens the same wa.me URL and timeline logs 'Order marked Shipped', legacy PB-2026-0001 renders one synthesized item row and wa button enables after refresh populates customer_phone from the customer join.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "OrderDetail header on legacy orders", "issues": ["On opening a legacy order the WhatsApp button is briefly disabled and the phone shows '—' until the GET /api/orders/{id} refresh completes (~1-2s). Harmless but a minor flash. Could be smoothed by setting detail=null while loading or by hiding the wa button until phone is known."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_paperbow_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Carried from iteration 5, still open) CI=true `yarn build` previously failed on react-hooks/exhaustive-deps in OrderDetail. In App.js line 50 the agent has added `// eslint-disable-next-line react-hooks/exhaustive-deps` above the useEffect — this will now build under CRA/CI. Please verify by running `cd /app/frontend && CI=true yarn build`.",
+    "App.js is now ~250 lines of single-line components. Still reads but is approaching unmaintainable; consider splitting NewOrderForm + OrderDetail + OrderTable into their own files.",
+    "`refresh()` inside OrderDetail is re-declared on every render (so the eslint-disable is OK today, but moving it into useCallback would be cleaner).",
+    "`setSearch(s=>s+\"\")` as a refresh trigger is fragile (same reference → no refetch in some React 18 paths). It happened to work in testing but prefer a dedicated `refreshToken` state or a direct refetch function."
+  ],
+  "critical_code_review_comments": [
+    "server.py create_order: `count_documents({}) + 1` as the order-id generator is racy — two concurrent POSTs will produce the same PB-YYYY-NNNN and the second insert will fail with a duplicate-key error on the unique `id` index. Use `find_one_and_update` on a counters doc, or catch DuplicateKeyError and retry.",
+    "server.py create_order: ObjectId(it.product_id) is inside the loop — fine for correctness but N db round-trips. Consider a single `find({_id:{$in:[...]}})` for performance.",
+    "server.py OrderIn.quantity (legacy field) defaults to 1 but has no ge=1 constraint, so a legacy POST with quantity=0 or negative will silently create a line with that qty. Add `ge=1`.",
+    "server.py: when legacy single-item POST is used, `customization` from top-level is applied to the synthesized item but `discount`/`tax_rate` are not accepted at the top level (only in items[]). Documented, but worth noting in API docs.",
+    "App.js waLink: for phones already starting with country code but not length 10 we still send as-is; good. However numbers with punctuation ('+91 98765 43210') are stripped to digits and prepended with 91 if resulting length ≠ 10. For a '+919876543210' (12 digits) we skip the 91 prefix — correct. Edge-case: an 11-digit number (e.g. US-style '19876543210') won't get the India prefix — acceptable since this is an India product.",
+    "App.js OrderDetail items fallback assumes `detail.total` equals unit_price when synthesizing an item for legacy orders — true for seeded qty=1 orders but subtly wrong for legacy orders with qty>1 (unit_price would be shown as the grand total). Minor cosmetic for legacy data only."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_paperbow_api.py"
+  ],
+  "success_rate": {
+    "backend": "100% (23/23)",
+    "frontend": "100% (all iteration-6 flows + regression open-order/legacy)"
+  },
+  "test_credentials": "admin@paperbow.in / Paperbow2026! (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "pytest creates TEST_-prefixed customers/products and PB-2026-00XX orders for the multi-item/legacy/invalid-product cases; Ananya Iyer (phone 9988776655) seeded customer is used by the frontend playwright multi-item flow (which created PB-2026-0023 and PB-2026-0024). Not cleaned up (test ids are unique-suffixed).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "backend_test.py now has 23 tests. Five new ones (test_multi_item_order_gst_math, test_legacy_single_item_still_works, test_order_without_items_or_product_id_rejected, test_order_with_invalid_product_rejected, test_legacy_seeded_order_has_customer_phone) cover iteration 6. Live playwright scripts in this report demonstrate the WhatsApp spy pattern: `window.open=(u)=>{window.__opened.push(u)}` BEFORE triggering status change or button click, then `await page.evaluate('window.__opened')`. When opening a legacy order remember to wait ~2s for the refresh() GET to populate customer_phone before asserting wa button enabled. The CI build concern from iteration 5 appears to be addressed via an eslint-disable comment on App.js:50 — verify with `cd /app/frontend && CI=true yarn build` before shipping.",
+  "rca of the issue": "No open bugs. Earlier flaky-looking failure in frontend test ('legacy wa button disabled') was a test timing bug — OrderDetail opens with the row's data (which has no customer_phone for legacy orders) and only enables the wa button after the GET /api/orders/{id} refresh resolves (~1-2s). Backend /api/orders/{id} correctly joins the customer collection and returns customer_phone=9876543210 for PB-2026-0001 (verified via curl). Fixed in the final playwright run by waiting 3s after opening the detail modal."
+}

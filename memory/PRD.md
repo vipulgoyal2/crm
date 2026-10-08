@@ -33,6 +33,16 @@ Build a full-stack internal CRM and order-management application for Paperbow, a
 - Testing agent: 18/18 pytest cases pass + full frontend Playwright flow passes.
 - Vercel-ready: `CI=true yarn build` compiles with no ESLint errors.
 
+### 2026-10-08 (iteration 6 — multi-item + WhatsApp)
+- Multi-item orders: order documents now carry `items[]` with per-line `unit_price`, `quantity`, `customization`, `discount`, `tax_rate`, `tax`, `line_total`. `subtotal`, `shipping_cost`, `tax`, `total`, `payment_status` computed server-side. Legacy single-item POST (product_id + quantity at root) still works and is synthesized into an `items[]` of length 1.
+- `GET /api/orders/{id}` joins the customer collection to inject `customer_phone` and `customer_email` so legacy orders can use WhatsApp too.
+- Order detail UI shows an "ITEMS" section with per-line price / discount / GST breakdown and a totals row (subtotal / shipping / tax / grand).
+- Order list row summary becomes "N items · {first product}…" for multi-item orders.
+- New Order modal: searchable customer picker, add/remove item rows (product + qty + customization + discount + GST%), sales channel, priority, shipping cost, payment method, amount paid, live totals.
+- WhatsApp nudge: `waLink()` builds a `wa.me/91{phone}` click-to-send URL with order id, item summary, courier and tracking. Manual "Notify on WhatsApp" button in order detail + auto-opens the moment status flips to Shipped. No API keys needed — fully portable.
+- 23/23 backend + 100% frontend tests pass.
+- Build: `CI=true yarn build` still green.
+
 ## Prioritized backlog
 
 ### P1

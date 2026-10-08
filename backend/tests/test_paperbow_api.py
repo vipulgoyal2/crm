@@ -295,3 +295,117 @@ def test_duplicate_product_sku_409(authed):
     r = authed.post(f"{BASE_URL}/api/products",
                     json={"sku": dup, "name": "x", "category": "c", "selling_price": 1})
     assert r.status_code == 409
+
+
+# ---------- multi-item orders (iteration 6) ----------
+def _seed_two_products(authed, suf):
+    """Create frame (899) and giftbox (1799) products for GST math test."""
+    p1 = authed.post(f"{BASE_URL}/api/products", json={
+        "sku": f"TESTFRAME-{suf}", "name": "Test Frame", "category": "Frames",
+        "selling_price": 899,
+    })
+    p2 = authed.post(f"{BASE_URL}/api/products", json={
+        "sku": f"TESTGIFT-{suf}", "name": "Test Giftbox", "category": "Gifts",
+        "selling_price": 1799,
+    })
+    assert p1.status_code == 200 and p2.status_code == 200, (p1.text, p2.text)
+    return p1.json()["id"], p2.json()["id"]
+
+
+def test_multi_item_order_gst_math(authed):
+    suf = uuid.uuid4().hex[:6]
+    cust = authed.post(f"{BASE_URL}/api/customers",
+                       json={"name": f"TEST_multi_{suf}", "phone": f"777{suf}00"}).json()
+    frame_id, gift_id = _seed_two_products(authed, suf)
+    payload = {
+        "customer_id": cust["id"],
+        "items": [
+            {"product_id": frame_id, "quantity": 2, "discount": 50, "tax_rate": 18},
+            {"product_id": gift_id, "quantity": 1, "tax_rate": 5},
+        ],
+        "shipping_cost": 80,
+        "amount_paid": 1000,
+    }
+    r = authed.post(f"{BASE_URL}/api/orders", json=payload)
+    assert r.status_code == 200, r.text
+    order = r.json()
+    assert len(order["items"]) == 2
+    assert order["subtotal"] == pytest.approx(3547, abs=0.5)
+    assert order["tax"] == pytest.approx(404.59, abs=0.5)
+    assert order["shipping_cost"] == 80
+    assert order["total"] == pytest.approx(4031.59, abs=0.5)
+    assert order["amount_paid"] == 1000
+    assert order["pending"] == pytest.approx(3031.59, abs=0.5)
+    assert order["payment_status"] == "Partially Paid"
+    # per-line math
+    line1 = order["items"][0]
+    assert line1["quantity"] == 2 and line1["unit_price"] == 899
+    assert line1["tax"] == pytest.approx(314.64, abs=0.1)
+    assert line1["line_total"] == pytest.approx(2062.64, abs=0.1)
+    line2 = order["items"][1]
+    assert line2["tax"] == pytest.approx(89.95, abs=0.1)
+    assert line2["line_total"] == pytest.approx(1888.95, abs=0.1)
+    # customer.spent incremented by GRAND total, not first item
+    custs = authed.get(f"{BASE_URL}/api/customers", params={"search": cust["phone"]}).json()
+    hit = next(c for c in custs if c["id"] == cust["id"])
+    assert hit["spent"] == pytest.approx(4031.59, abs=0.5)
+    # GET detail returns customer_phone/email
+    detail = authed.get(f"{BASE_URL}/api/orders/{order['id']}").json()
+    assert detail["customer_phone"] == cust["phone"]
+
+
+def test_legacy_single_item_still_works(authed):
+    suf = uuid.uuid4().hex[:6]
+    cust = authed.post(f"{BASE_URL}/api/customers",
+                       json={"name": f"TEST_legacy_{suf}", "phone": f"666{suf}00"}).json()
+    prod = authed.post(f"{BASE_URL}/api/products", json={
+        "sku": f"TESTLEG-{suf}", "name": "Legacy Prod", "category": "x",
+        "selling_price": 500,
+    }).json()
+    r = authed.post(f"{BASE_URL}/api/orders", json={
+        "customer_id": cust["id"], "product_id": prod["id"], "quantity": 2,
+        "amount_paid": 1000,
+    })
+    assert r.status_code == 200, r.text
+    order = r.json()
+    assert len(order["items"]) == 1
+    assert order["items"][0]["product_id"] == prod["id"]
+    assert order["items"][0]["quantity"] == 2
+    assert order["total"] == 1000
+    assert order["payment_status"] == "Paid"
+
+
+def test_order_without_items_or_product_id_rejected(authed):
+    suf = uuid.uuid4().hex[:6]
+    cust = authed.post(f"{BASE_URL}/api/customers",
+                       json={"name": f"TEST_noprod_{suf}", "phone": f"555{suf}00"}).json()
+    r = authed.post(f"{BASE_URL}/api/orders", json={"customer_id": cust["id"]})
+    assert r.status_code == 400
+    assert "at least one product" in r.text.lower()
+
+
+def test_order_with_invalid_product_rejected(authed):
+    suf = uuid.uuid4().hex[:6]
+    cust = authed.post(f"{BASE_URL}/api/customers",
+                       json={"name": f"TEST_badprod_{suf}", "phone": f"444{suf}00"}).json()
+    # Invalid ObjectId format -> 400
+    r = authed.post(f"{BASE_URL}/api/orders", json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": "not-an-oid", "quantity": 1}],
+    })
+    assert r.status_code == 400
+    # Valid ObjectId format but non-existent -> 404
+    r2 = authed.post(f"{BASE_URL}/api/orders", json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": "507f1f77bcf86cd799439011", "quantity": 1}],
+    })
+    assert r2.status_code in (400, 404)
+
+
+def test_legacy_seeded_order_has_customer_phone(authed):
+    """GET /api/orders/{PB-2026-0001} must join customer and return phone/email."""
+    detail = authed.get(f"{BASE_URL}/api/orders/PB-2026-0001").json()
+    assert "customer_phone" in detail
+    assert detail["customer_phone"], "Legacy order should get phone joined from customer"
+    assert "customer_email" in detail
+
