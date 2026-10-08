@@ -91,7 +91,10 @@ class OrderIn(BaseModel):
 def clean(doc):
     if not doc: return doc
     doc = dict(doc)
-    if "_id" in doc: doc["id"] = str(doc.pop("_id"))
+    if "_id" in doc:
+        mongo_id = str(doc.pop("_id"))
+        if "id" not in doc:
+            doc["id"] = mongo_id
     return doc
 
 @api.get("/")
@@ -100,9 +103,16 @@ async def root():
 
 @api.post("/auth/login")
 async def login(body: Login, response: Response):
-    user = await db.users.find_one({"email": body.email.lower()})
+    identifier = body.email.lower()
+    attempt = await db.login_attempts.find_one({"identifier": identifier})
+    if attempt and attempt.get("locked_until", "") > now():
+        raise HTTPException(429, "Too many attempts. Try again shortly.")
+    user = await db.users.find_one({"email": identifier})
     if not user or not verify_password(body.password, user["password_hash"]):
+        failed = (attempt or {}).get("failed", 0) + 1
+        await db.login_attempts.update_one({"identifier": identifier}, {"$set": {"failed": failed, "locked_until": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat() if failed >= 5 else ""}}, upsert=True)
         raise HTTPException(401, "Incorrect email or password")
+    await db.login_attempts.delete_one({"identifier": identifier})
     access = token_for(str(user["_id"]), user["email"], "access", 15)
     refresh = token_for(str(user["_id"]), user["email"], "refresh", 10080)
     response.set_cookie("access_token", access, httponly=True, samesite="lax", max_age=900)
@@ -190,9 +200,11 @@ app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=list(se
 
 async def seed_data():
     await db.users.create_index("email", unique=True)
+    await db.login_attempts.create_index("identifier", unique=True)
     email, password = os.environ["ADMIN_EMAIL"], os.environ["ADMIN_PASSWORD"]
     existing = await db.users.find_one({"email": email})
     if not existing: await db.users.insert_one({"email": email, "password_hash": hash_password(password), "name": "Aarav Mehta", "role": "admin", "created_at": now()})
+    elif not verify_password(password, existing["password_hash"]): await db.users.update_one({"_id": existing["_id"]}, {"$set": {"password_hash": hash_password(password)}})
     if await db.products.count_documents({}) == 0:
         products = [{"sku": f"{sku}", "name": name, "category": cat, "selling_price": price, "cost_price": price*.42, "stock": stock, "production_method": method, "status": "Active", "created_at": now()} for sku,name,cat,price,stock,method in [("FRAME-001","Classic Photo Frame","Frames",899,18,"Laser"),("MUG-001","Signature Couple Mug","Mugs",499,42,"Sublimation"),("UV-014","Acrylic Memory Plaque","UV Printed Products",1299,9,"UV"),("GIFT-022","Story Box Gift Set","Personalized Gifts",1799,6,"Outsourced")]]
         await db.products.insert_many(products)
