@@ -33,6 +33,7 @@ function OrderDetail({order,onClose}) {
   const [category,setCategory]=useState("Customer Upload");
   const [busy,setBusy]=useState(false);
   const refresh=async()=>{const r=await api.get(`/orders/${order.id}`);setDetail(r.data)};
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(()=>{refresh()},[order.id]);
   const update=async(path,body)=>{
     setBusy(true);

@@ -1,0 +1,39 @@
+{
+  "summary": "Full backend + frontend regression on Paperbow CRM. 18/18 pytest cases pass against the public preview URL covering auth (login/me/logout + lockout on scratch email), dashboard shape, orders filtering/search/detail, notes, payment, operations, status, GridFS file upload+download, CSV export, CSV import preview+commit (customers/products/orders), retention, duplicate protection (409), unauthenticated 401 guards. Frontend Playwright flow against the public URL passed login/greeting (Aarav), sidebar navigation, Delivered status filter, order-detail note add, status change, GridFS file upload + file-chip rendering, CSV import wizard (upload \u2192 preview with errors \u2192 commit \u2192 done \u2192 finish), and mobile sidebar open/close with no horizontal overflow.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_paperbow_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "`yarn build` passes locally but fails under CI=true (Vercel default) because of a react-hooks/exhaustive-deps ESLint warning in src/App.js line 36 (OrderDetail useEffect missing `refresh` in deps). Either wrap `refresh` in useCallback and include it in deps, or add an eslint-disable-next-line comment. Without this, Vercel deploys will fail."
+  ],
+  "critical_code_review_comments": [
+    "src/App.js is one giant 180-line single-line-per-component file. It builds and works, but readability and maintainability are poor \u2014 split into components/{Login,Dashboard,OrderDetail,OrderTable,Records,ImportWizard,RetentionInsights}.jsx.",
+    "backend/server.py `_coerce_row` for orders does not stamp `payment_status`, `priority`, `channel`, or `status` defaults when importing orders CSV with missing columns; may leave Mongo docs in an inconsistent shape.",
+    "CORS falls back to `['http://localhost:3000','http://localhost:5173']` when `CORS_ORIGINS=\"*\"`; the public preview origin is NOT in the allow list, so a browser from the preview URL would be blocked. Today the frontend is same-origin with the backend (both proxied through the preview domain) so it works, but any split deployment will break. Switch to parsing `CORS_ORIGINS` as explicit origins and require it to contain the preview host.",
+    "`/api/orders/{id}/status` takes `status` as a query param rather than a JSON body \u2014 slightly inconsistent with the other PATCH endpoints. Harmless but worth tidying.",
+    "`clean()` strips `_id` only at the top level; nested documents (e.g. embedded timeline / file sub-docs) are already projected without `_id`, so OK today, but future embedded additions could leak ObjectIds."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_paperbow_api.py"
+  ],
+  "success_rate": {
+    "backend": "100% (18/18)",
+    "frontend": "100% (all critical flows + mobile)"
+  },
+  "seed_data_creation": "Tests create TEST_-prefixed customers/products and scratch orders; CSV import test inserts `Wiz UI <uniq>` customers and `TESTIMP-<uniq>` products / `PB-IMP-<uniq>` orders. Not cleaned up (idempotent by unique field).",
+  "test_credentials": "admin@paperbow.in / Paperbow2026! (from /app/memory/test_credentials.md). Lockout test uses scratch_<uuid>@example.com so the admin is never locked.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "backend_test.py now covers every endpoint in the problem statement including GridFS upload/download, CSV import wizard preview+commit, lockout (scratch email on example.com since EmailStr rejects .test TLD). Run with `REACT_APP_BACKEND_URL=... pytest backend/tests/test_paperbow_api.py -n 0`. Only outstanding action item is the CRA/Vercel CI build failure due to react-hooks/exhaustive-deps on OrderDetail\u2019s useEffect.",
+  "rca of the issue": "yarn build CI failure RCA: in src/App.js line 36, `useEffect(()=>{refresh()},[order.id])` references `refresh` (defined inside the component on line 35) without including it in the dependency array. react-hooks/exhaustive-deps emits a warning; CRA treats warnings as errors when CI=true. Fix: `const refresh = useCallback(async()=>{...},[order.id])` and `useEffect(()=>{refresh()},[refresh])`, or add `// eslint-disable-next-line react-hooks/exhaustive-deps`."
+}

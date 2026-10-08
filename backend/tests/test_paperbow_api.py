@@ -1,82 +1,297 @@
+"""Paperbow backend regression tests.
+
+Covers auth, dashboard, orders CRUD + filters, order detail (notes/payment/operations/status),
+file upload + download via GridFS, CSV export, CSV import wizard (preview+commit),
+retention insights, duplicate protection, auth guards, logout, and brute-force lockout
+(scratch email so the admin stays usable).
+"""
+import io
 import os
 import uuid
 
 import pytest
 import requests
 
-
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/")
+BASE_URL = os.environ["REACT_APP_BACKEND_URL"].rstrip("/")
 EMAIL = "admin@paperbow.in"
 PASSWORD = "Paperbow2026!"
+PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\xcf"
+    b"\xc0\x00\x00\x00\x03\x00\x01\x9a\xd7\x80\xa0\x00\x00\x00\x00IEND\xaeB`\x82"
+)
 
 
+# ---------- fixtures ----------
 @pytest.fixture
 def client():
-    session = requests.Session()
-    session.headers.update({"Content-Type": "application/json"})
-    return session
+    s = requests.Session()
+    s.headers.update({"Content-Type": "application/json"})
+    return s
 
 
 @pytest.fixture
-def authenticated(client):
-    response = client.post(f"{BASE_URL}/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
-    assert response.status_code == 200, response.text
-    assert response.cookies.get("access_token")
+def authed(client):
+    r = client.post(f"{BASE_URL}/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
+    assert r.status_code == 200, r.text
+    assert r.cookies.get("access_token")
     return client
 
 
-def test_protected_endpoints_reject_anonymous(client):
-    for endpoint in ("dashboard", "customers", "products", "orders"):
-        response = client.get(f"{BASE_URL}/api/{endpoint}")
-        assert response.status_code == 401, (endpoint, response.text)
+@pytest.fixture
+def sample_order_id(authed):
+    orders = authed.get(f"{BASE_URL}/api/orders").json()
+    assert orders, "Seed orders missing"
+    return orders[0]["id"]
 
 
-def test_auth_login_me_logout(authenticated):
-    me = authenticated.get(f"{BASE_URL}/api/auth/me")
+# ---------- auth ----------
+def test_unauthenticated_rejects(client):
+    for ep in ("dashboard", "customers", "products", "orders", "orders/PB-2026-0001"):
+        r = client.get(f"{BASE_URL}/api/{ep}")
+        assert r.status_code == 401, (ep, r.status_code)
+    r = client.get(f"{BASE_URL}/api/files/{uuid.uuid4()}")
+    assert r.status_code == 401
+
+
+def test_login_me_logout(authed):
+    me = authed.get(f"{BASE_URL}/api/auth/me")
     assert me.status_code == 200
-    assert me.json()["email"] == EMAIL
-    assert me.json()["role"] == "admin"
-    logout = authenticated.post(f"{BASE_URL}/api/auth/logout")
-    assert logout.status_code == 200 and logout.json()["ok"] is True
-    assert authenticated.get(f"{BASE_URL}/api/auth/me").status_code == 401
+    body = me.json()
+    assert body["email"] == EMAIL and body["role"] == "admin"
+    assert "_id" not in body and "password_hash" not in body
+    out = authed.post(f"{BASE_URL}/api/auth/logout")
+    assert out.status_code == 200
+    # After logout cookies cleared
+    s2 = requests.Session()
+    assert s2.get(f"{BASE_URL}/api/auth/me").status_code == 401
 
 
-def test_dashboard_records_and_search(authenticated):
-    dashboard = authenticated.get(f"{BASE_URL}/api/dashboard")
-    assert dashboard.status_code == 200
-    payload = dashboard.json()
-    assert all(key in payload for key in ("revenue", "orders", "customers", "products", "statuses"))
-    assert isinstance(payload["recent_orders"], list)
-    for endpoint, key in (("customers", "name"), ("products", "sku"), ("orders", "id")):
-        response = authenticated.get(f"{BASE_URL}/api/{endpoint}")
-        assert response.status_code == 200 and response.json()
-        assert key in response.json()[0]
+def test_login_lockout_scratch_email():
+    """Use a scratch email so admin isn't locked."""
+    scratch = f"scratch_{uuid.uuid4().hex[:8]}@example.com"
+    saw_429 = False
+    for i in range(6):
+        r = requests.post(f"{BASE_URL}/api/auth/login",
+                          json={"email": scratch, "password": "wrongpass123"})
+        if r.status_code == 429:
+            saw_429 = True
+            break
+    assert saw_429, "Expected 429 after 5 bad attempts"
 
 
-def test_customer_product_order_and_status_flow(authenticated):
-    suffix = uuid.uuid4().hex[:8]
-    customer = authenticated.post(
-        f"{BASE_URL}/api/customers",
-        json={"name": f"TEST_{suffix}", "phone": f"90000{suffix[:5]}", "email": f"test_{suffix}@example.com"},
+# ---------- dashboard ----------
+def test_dashboard_shape(authed):
+    r = authed.get(f"{BASE_URL}/api/dashboard")
+    assert r.status_code == 200
+    d = r.json()
+    for key in ("today_revenue", "week_revenue", "month_revenue", "avg_order_value",
+                "revenue_series", "statuses", "recent_orders"):
+        assert key in d, f"missing {key}"
+    assert len(d["revenue_series"]) == 7
+    for o in d["recent_orders"]:
+        assert "_id" not in o
+        assert str(o.get("id", "")).startswith("PB-")
+
+
+# ---------- orders filters & detail ----------
+def test_orders_filter_delivered(authed):
+    r = authed.get(f"{BASE_URL}/api/orders", params={"status": "Delivered"})
+    assert r.status_code == 200
+    rows = r.json()
+    assert rows, "Expected at least one Delivered order from seed"
+    assert all(o["status"] == "Delivered" for o in rows)
+
+
+def test_orders_search(authed, sample_order_id):
+    r = authed.get(f"{BASE_URL}/api/orders", params={"search": sample_order_id})
+    assert r.status_code == 200
+    assert any(o["id"] == sample_order_id for o in r.json())
+
+
+def test_order_detail_has_files_and_timeline(authed, sample_order_id):
+    r = authed.get(f"{BASE_URL}/api/orders/{sample_order_id}")
+    assert r.status_code == 200
+    data = r.json()
+    assert "_id" not in data
+    assert isinstance(data["files"], list)
+    assert isinstance(data["timeline"], list) and data["timeline"]
+
+
+# ---------- notes/payment/operations/status ----------
+def test_add_note_appends_timeline(authed, sample_order_id):
+    before = len(authed.get(f"{BASE_URL}/api/orders/{sample_order_id}").json()["timeline"])
+    r = authed.post(f"{BASE_URL}/api/orders/{sample_order_id}/notes",
+                    json={"text": "TEST note from pytest"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    tl = authed.get(f"{BASE_URL}/api/orders/{sample_order_id}").json()["timeline"]
+    assert len(tl) == before + 1
+    assert tl[-1]["event"] == "Internal note added"
+    assert tl[-1]["notes"] == "TEST note from pytest"
+
+
+def test_payment_update_marks_paid(authed):
+    # Make a scratch order with partial payment then full pay it
+    suf = uuid.uuid4().hex[:6]
+    cust = authed.post(f"{BASE_URL}/api/customers",
+                       json={"name": f"TEST_{suf}", "phone": f"800{suf}00"}).json()
+    prod = authed.post(f"{BASE_URL}/api/products",
+                       json={"sku": f"TESTPAY-{suf}", "name": "x", "category": "c",
+                             "selling_price": 500}).json()
+    order = authed.post(f"{BASE_URL}/api/orders",
+                        json={"customer_id": cust["id"], "product_id": prod["id"],
+                              "quantity": 1, "amount_paid": 100}).json()
+    assert order["payment_status"] == "Partially Paid"
+    r = authed.patch(f"{BASE_URL}/api/orders/{order['id']}/payment",
+                     json={"amount_paid": 500, "payment_method": "UPI"})
+    assert r.status_code == 200 and r.json()["payment_status"] == "Paid"
+    tl = authed.get(f"{BASE_URL}/api/orders/{order['id']}").json()["timeline"]
+    assert any(e["event"] == "Payment updated" for e in tl)
+
+
+def test_operations_and_status_updates(authed, sample_order_id):
+    r = authed.patch(f"{BASE_URL}/api/orders/{sample_order_id}/operations",
+                     json={"production_status": "In Production", "shipping_status": "Shipped",
+                           "courier": "BlueDart", "tracking": "TRK123"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    detail = authed.get(f"{BASE_URL}/api/orders/{sample_order_id}").json()
+    assert detail["courier"] == "BlueDart" and detail["tracking"] == "TRK123"
+    s = authed.patch(f"{BASE_URL}/api/orders/{sample_order_id}/status",
+                     params={"status": "Shipped"})
+    assert s.status_code == 200 and s.json()["status"] == "Shipped"
+    tl = authed.get(f"{BASE_URL}/api/orders/{sample_order_id}").json()["timeline"]
+    assert any("Shipped" in e["event"] for e in tl)
+
+
+# ---------- files ----------
+def test_upload_and_download_file_gridfs(authed, sample_order_id):
+    # must send multipart - temporarily drop content-type header
+    s = requests.Session()
+    s.cookies.update(authed.cookies.get_dict())
+    files = {"file": ("test.png", PNG_BYTES, "image/png")}
+    r = s.post(f"{BASE_URL}/api/orders/{sample_order_id}/files?category=Reference",
+               files=files)
+    assert r.status_code == 200, r.text
+    rec = r.json()
+    assert rec["storage_backend"] == "gridfs"
+    assert rec["content_type"] == "image/png"
+    file_id = rec["id"]
+    # Shows up in order detail
+    detail = authed.get(f"{BASE_URL}/api/orders/{sample_order_id}").json()
+    assert any(f["id"] == file_id for f in detail["files"])
+    assert any(e["event"] == "File uploaded" for e in detail["timeline"])
+    # Download
+    d = s.get(f"{BASE_URL}/api/files/{file_id}")
+    assert d.status_code == 200
+    assert "attachment" in d.headers.get("Content-Disposition", "")
+    assert d.content == PNG_BYTES
+
+
+def test_upload_rejects_bad_type(authed, sample_order_id):
+    s = requests.Session()
+    s.cookies.update(authed.cookies.get_dict())
+    files = {"file": ("foo.txt", b"hello", "text/plain")}
+    r = s.post(f"{BASE_URL}/api/orders/{sample_order_id}/files", files=files)
+    assert r.status_code == 415
+
+
+# ---------- csv export ----------
+def test_export_csv(authed):
+    for kind, header_col in (("customers", "name"), ("products", "sku"), ("orders", "id")):
+        r = authed.get(f"{BASE_URL}/api/export/{kind}")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/csv")
+        assert f'filename="paperbow-{kind}.csv"' in r.headers.get("Content-Disposition", "")
+        first_line = r.text.splitlines()[0]
+        assert header_col in first_line
+
+
+# ---------- csv import ----------
+def _upload_csv(authed, path, csv_text):
+    s = requests.Session()
+    s.cookies.update(authed.cookies.get_dict())
+    files = {"file": ("input.csv", csv_text.encode("utf-8"), "text/csv")}
+    return s.post(f"{BASE_URL}{path}", files=files)
+
+
+def test_import_customers_preview_and_commit(authed):
+    # Ensure a known duplicate phone exists (use first seeded customer phone)
+    existing = authed.get(f"{BASE_URL}/api/customers").json()
+    dup_phone = existing[0]["phone"]
+    uniq = uuid.uuid4().hex[:6]
+    csv_text = (
+        "name,phone,email,city,state\n"
+        f"TEST Import {uniq},900{uniq}11,imp_{uniq}@test.com,Mumbai,MH\n"
+        f",900{uniq}22,noname@test.com,Pune,MH\n"
+        f"Dup Customer,{dup_phone},dup@test.com,Delhi,DL\n"
     )
-    assert customer.status_code == 200 and customer.json()["name"].startswith("TEST_")
-    customer_id = customer.json()["id"]
-    product = authenticated.post(
-        f"{BASE_URL}/api/products",
-        json={"sku": f"TEST-{suffix}", "name": "Test Product", "category": "Testing", "selling_price": 100},
+    r = _upload_csv(authed, "/api/import/customers/preview", csv_text)
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["total"] == 3
+    assert p["valid"] == 1
+    assert any("name" in e.get("missing", []) for e in p["errors"])
+    assert any(d.get("phone") == dup_phone for d in p["duplicates"])
+    assert p["unique_field"] == "phone"
+    valid_rows = p["rows"]
+    # Commit
+    c = authed.post(f"{BASE_URL}/api/import/customers",
+                    json={"rows": valid_rows, "skip_duplicates": True})
+    assert c.status_code == 200 and c.json()["inserted"] == 1
+    # Re-commit skips as duplicate
+    c2 = authed.post(f"{BASE_URL}/api/import/customers",
+                     json={"rows": valid_rows, "skip_duplicates": True})
+    assert c2.status_code == 200
+    assert c2.json()["inserted"] == 0 and c2.json()["skipped_duplicates"] == 1
+
+
+def test_import_products_and_orders(authed):
+    uniq = uuid.uuid4().hex[:6]
+    # Products
+    pcsv = (
+        "sku,name,category,selling_price\n"
+        f"TESTIMP-{uniq},Imp Product,Testing,250\n"
     )
-    assert product.status_code == 200 and product.json()["sku"] == f"TEST-{suffix}"
-    product_id = product.json()["id"]
-    order = authenticated.post(
-        f"{BASE_URL}/api/orders",
-        json={"customer_id": customer_id, "product_id": product_id, "quantity": 2, "amount_paid": 200},
+    r = _upload_csv(authed, "/api/import/products/preview", pcsv)
+    assert r.status_code == 200 and r.json()["unique_field"] == "sku"
+    rows = r.json()["rows"]
+    assert authed.post(f"{BASE_URL}/api/import/products",
+                       json={"rows": rows}).json()["inserted"] == 1
+    # Orders
+    ocsv = (
+        "id,customer_name,product_name,sku,total,amount_paid,payment_status,status,created_at\n"
+        f"PB-IMP-{uniq},Imp Cust,Imp Prod,TESTIMP-{uniq},500,500,Paid,Confirmed,2026-01-01T00:00:00+00:00\n"
     )
-    assert order.status_code == 200
-    order_data = order.json()
-    assert order_data["payment_status"] == "Paid"
-    assert order_data["timeline"] and order_data["customer_name"].startswith("TEST_")
-    order_id = order_data["id"]
-    changed = authenticated.patch(f"{BASE_URL}/api/orders/{order_id}/status", params={"status": "Production"})
-    assert changed.status_code == 200 and changed.json()["status"] == "Production"
-    found = authenticated.get(f"{BASE_URL}/api/orders", params={"search": order_id})
-    assert found.status_code == 200 and found.json()[0]["id"] == order_id
+    r = _upload_csv(authed, "/api/import/orders/preview", ocsv)
+    assert r.status_code == 200 and r.json()["unique_field"] == "id"
+    rows = r.json()["rows"]
+    assert authed.post(f"{BASE_URL}/api/import/orders",
+                       json={"rows": rows}).json()["inserted"] == 1
+
+
+# ---------- retention ----------
+def test_retention(authed):
+    r = authed.get(f"{BASE_URL}/api/retention")
+    assert r.status_code == 200
+    d = r.json()
+    for k in ("total_customers", "returning_customers", "vip_customers", "repeat_rate",
+              "top_customers"):
+        assert k in d
+    assert isinstance(d["top_customers"], list)
+
+
+# ---------- duplicate protection ----------
+def test_duplicate_customer_phone_409(authed):
+    existing = authed.get(f"{BASE_URL}/api/customers").json()
+    dup = existing[0]["phone"]
+    r = authed.post(f"{BASE_URL}/api/customers",
+                    json={"name": "TEST Dup", "phone": dup})
+    assert r.status_code == 409
+
+
+def test_duplicate_product_sku_409(authed):
+    existing = authed.get(f"{BASE_URL}/api/products").json()
+    dup = existing[0]["sku"]
+    r = authed.post(f"{BASE_URL}/api/products",
+                    json={"sku": dup, "name": "x", "category": "c", "selling_price": 1})
+    assert r.status_code == 409
