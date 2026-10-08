@@ -769,76 +769,25 @@ async def seed_data():
     await db.products.create_index("sku", unique=True)
     await db.orders.create_index("id", unique=True)
     await db.files.create_index("order_id")
+
     email = os.environ["ADMIN_EMAIL"]
     password = os.environ["ADMIN_PASSWORD"]
+
     existing = await db.users.find_one({"email": email})
+
     if not existing:
         await db.users.insert_one({
-            "email": email, "password_hash": hash_password(password),
-            "name": "Aarav Mehta", "role": "admin", "created_at": now(),
+            "email": email,
+            "password_hash": hash_password(password),
+            "name": "Paperbow Admin",
+            "role": "admin",
+            "created_at": now(),
         })
     elif not verify_password(password, existing["password_hash"]):
         await db.users.update_one(
             {"_id": existing["_id"]},
             {"$set": {"password_hash": hash_password(password)}},
         )
-    if await db.products.count_documents({}) == 0:
-        products_seed = [
-            ("FRAME-001", "Classic Photo Frame", "Frames", 899, 18, "Laser"),
-            ("MUG-001", "Signature Couple Mug", "Mugs", 499, 42, "Sublimation"),
-            ("UV-014", "Acrylic Memory Plaque", "UV Printed Products", 1299, 9, "UV"),
-            ("GIFT-022", "Story Box Gift Set", "Personalized Gifts", 1799, 6, "Outsourced"),
-            ("DTF-033", "Custom T-Shirt Print", "DTF Products", 599, 24, "DTF"),
-        ]
-        await db.products.insert_many([
-            {"sku": sku, "name": name, "category": cat,
-             "selling_price": price, "cost_price": price * .42,
-             "stock": stock, "production_method": method, "status": "Active",
-             "created_at": now()}
-            for sku, name, cat, price, stock, method in products_seed
-        ])
-    if await db.customers.count_documents({}) == 0:
-        names = [
-            ("Riya Sharma", "9876543210", "Mumbai", "Maharashtra"),
-            ("Kabir Singh", "9812345678", "Delhi", "Delhi"),
-            ("Ananya Iyer", "9988776655", "Bengaluru", "Karnataka"),
-            ("Vikram Rao", "9898989898", "Hyderabad", "Telangana"),
-            ("Meera Kapoor", "9765432109", "Pune", "Maharashtra"),
-        ]
-        await db.customers.insert_many([
-            {"name": n, "phone": p, "city": c, "state": s,
-             "email": f"{n.split()[0].lower()}@example.com",
-             "orders": 0, "spent": 0, "type": "New",
-             "created_at": now(), "archived": False}
-            for n, p, c, s in names
-        ])
-    if await db.orders.count_documents({}) == 0:
-        custs = await db.customers.find().to_list(5)
-        prods = await db.products.find().to_list(4)
-        for i in range(8):
-            c = custs[i % len(custs)]
-            p = prods[i % len(prods)]
-            total = p["selling_price"]
-            created = (datetime.now(timezone.utc) - timedelta(days=i)).isoformat()
-            order_doc = {
-                "id": f"PB-2026-{i + 1:04d}",
-                "customer_id": str(c["_id"]), "customer_name": c["name"],
-                "product_id": str(p["_id"]), "product_name": p["name"], "sku": p["sku"],
-                "quantity": 1, "total": total, "amount_paid": total, "pending": 0,
-                "payment_status": "Paid", "payment_method": "UPI",
-                "status": ["Production", "Quality Check", "Ready to Ship", "Shipped", "Delivered"][i % 5],
-                "production_status": "In Production",
-                "shipping_status": "Shipped" if i % 5 > 2 else "Not Ready",
-                "customization": "Personalized name and date",
-                "channel": "WhatsApp", "priority": "Normal",
-                "created_at": created,
-                "timeline": [{"event": "Order created", "date": created, "user": "Aarav Mehta"}],
-            }
-            await db.orders.insert_one(order_doc)
-            await db.customers.update_one(
-                {"_id": c["_id"]},
-                {"$inc": {"orders": 1, "spent": total}, "$set": {"type": "Returning"}},
-            )
 
 @app.on_event("startup")
 async def startup():
