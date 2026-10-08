@@ -1,0 +1,41 @@
+{
+  "summary": "Final regression passed: production build, login, optional customer location fields, product required fields, protected APIs, PB-* order creation, and status persistence all work. A rapid navigation race can briefly render Orders with product records due to shared async items state.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Rapid navigation between Products and Orders",
+        "issue": "The screenshot captured Orders content populated with product-shaped records (ObjectId-like IDs, SKU in product column, ₹0 amounts, Active status) while Products was highlighted. App uses one shared items state and does not discard stale responses when page changes.",
+        "affected_selectors": ["[data-testid=\"nav-products\"]", "[data-testid=\"nav-orders\"]", "[data-testid=\"orders-search-input\"]"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_paperbow_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Guard the shared records load against stale responses or keep separate customer/product/order state so rapid navigation cannot display the wrong record type."
+  ],
+  "critical_code_review_comments": [
+    "App.js loads all records into one items state without cancellation or page identity checks; a slower previous request can overwrite the current page's data."
+  ],
+  "updated_files": [
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/iteration_3.json"
+  ],
+  "success_rate": {
+    "backend": "100%",
+    "frontend": "95%"
+  },
+  "seed_data_creation": "Existing regression tests and UI created TEST_-prefixed customers/products/orders; no production records were intentionally deleted. PB-2026-0013 was temporarily moved to Quality Check for persistence verification and restored to Production.",
+  "retest_needed": true,
+  "should_call_test_agent_after_fix": true,
+  "context_for_next_testing_agent": "Auth cookies, protected endpoints, customer optional city/state, product required fields, build, and PB-* create/PATCH/GET persistence are covered. Reproduce rapid Products↔Orders navigation after fixing stale async items responses.",
+  "rca of the issue": "In App.js, the page effect asynchronously assigns every records response to the same items state. Requests are not cancelled and the response is not checked against the page that initiated it, allowing out-of-order responses to render a different resource type in the active table."
+}
