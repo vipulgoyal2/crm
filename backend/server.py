@@ -5,13 +5,18 @@ load_dotenv(Path(__file__).parent / ".env")
 import logging
 import os
 import secrets
+import csv
+import io
+import uuid
+import requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import bcrypt
 import jwt
 from bson import ObjectId
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, UploadFile, File, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
@@ -87,6 +92,38 @@ class OrderIn(BaseModel):
     payment_method: str = "UPI"
     amount_paid: float = 0
     priority: str = "Normal"
+
+class PaymentUpdate(BaseModel):
+    amount_paid: float
+    payment_method: str = "UPI"
+    transaction_id: str = ""
+    payment_notes: str = ""
+
+class OperationsUpdate(BaseModel):
+    production_status: Optional[str] = None
+    qc_status: Optional[str] = None
+    qc_notes: Optional[str] = None
+    shipping_status: Optional[str] = None
+    courier: Optional[str] = None
+    tracking: Optional[str] = None
+
+STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
+STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
+storage_key = None
+
+def init_storage():
+    global storage_key
+    if storage_key or not os.environ.get("EMERGENT_LLM_KEY"):
+        return storage_key
+    result = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": os.environ["EMERGENT_LLM_KEY"]}, timeout=30)
+    result.raise_for_status(); storage_key = result.json()["storage_key"]
+    return storage_key
+
+def put_object(path, data, content_type):
+    key = init_storage()
+    if not key: raise HTTPException(503, "File storage is not configured")
+    result = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
+    result.raise_for_status(); return result.json()
 
 def clean(doc):
     if not doc: return doc
@@ -188,6 +225,80 @@ async def update_status(order_id: str, status: str, user=Depends(current_user)):
     event = {"event": f"Order marked {status}", "date": now(), "user": user["name"]}
     await db.orders.update_one({"id": order_id}, {"$set": {"status": status}, "$push": {"timeline": event}})
     return {"ok": True, "status": status}
+
+@api.get("/orders/{order_id}")
+async def order_detail(order_id: str, user=Depends(current_user)):
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order: raise HTTPException(404, "Order not found")
+    order["files"] = await db.files.find({"order_id": order_id, "is_deleted": False}, {"_id": 0}).to_list(100)
+    return order
+
+@api.patch("/orders/{order_id}/payment")
+async def update_payment(order_id: str, body: PaymentUpdate, user=Depends(current_user)):
+    order = await db.orders.find_one({"id": order_id})
+    if not order: raise HTTPException(404, "Order not found")
+    paid = min(max(body.amount_paid, 0), float(order.get("total", 0)))
+    status = "Paid" if paid >= order.get("total", 0) else ("Partially Paid" if paid else "Pending")
+    event = {"event": "Payment updated", "date": now(), "user": user["name"], "notes": f"{status} via {body.payment_method}"}
+    await db.orders.update_one({"id": order_id}, {"$set": {"amount_paid": paid, "pending": order.get("total", 0)-paid, "payment_status": status, "payment_method": body.payment_method, "transaction_id": body.transaction_id, "payment_notes": body.payment_notes}, "$push": {"timeline": event}})
+    return {"ok": True, "payment_status": status, "amount_paid": paid, "pending": order.get("total", 0)-paid}
+
+@api.patch("/orders/{order_id}/operations")
+async def update_operations(order_id: str, body: OperationsUpdate, user=Depends(current_user)):
+    order = await db.orders.find_one({"id": order_id})
+    if not order: raise HTTPException(404, "Order not found")
+    changes = {k: v for k, v in body.model_dump().items() if v is not None}
+    events = [{"event": f"{k.replace('_', ' ').title()} updated", "date": now(), "user": user["name"], "notes": v} for k, v in changes.items()]
+    await db.orders.update_one({"id": order_id}, {"$set": changes, "$push": {"timeline": {"$each": events}}})
+    return {"ok": True, "updated": changes}
+
+@api.post("/orders/{order_id}/files")
+async def upload_order_file(order_id: str, file: UploadFile = File(...), category: str = Query("Customer Upload"), user=Depends(current_user)):
+    order = await db.orders.find_one({"id": order_id}, {"_id": 1})
+    if not order: raise HTTPException(404, "Order not found")
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024: raise HTTPException(413, "Files must be smaller than 10MB")
+    allowed = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+    if file.content_type not in allowed: raise HTTPException(415, "Use JPG, PNG, WEBP, or PDF files")
+    path = f"paperbow/uploads/{order_id}/{uuid.uuid4()}.{(file.filename or 'file').split('.')[-1]}"
+    result = put_object(path, content, file.content_type)
+    doc = {"id": str(uuid.uuid4()), "order_id": order_id, "storage_path": result["path"], "original_filename": file.filename, "content_type": file.content_type, "size": len(content), "category": category, "is_deleted": False, "created_at": now()}
+    await db.files.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+@api.get("/retention")
+async def retention(user=Depends(current_user)):
+    customers = await db.customers.find({"archived": {"$ne": True}}, {"_id": 0, "name": 1, "orders": 1, "spent": 1, "type": 1}).sort("spent", -1).to_list(100)
+    total = len(customers); returning = len([c for c in customers if c.get("orders", 0) > 1]); vip = len([c for c in customers if c.get("type") == "VIP" or c.get("spent", 0) >= 5000])
+    return {"total_customers": total, "returning_customers": returning, "vip_customers": vip, "repeat_rate": round(returning / total * 100, 1) if total else 0, "top_customers": customers[:5]}
+
+@api.get("/export/{kind}")
+async def export_csv(kind: str, user=Depends(current_user)):
+    configs = {"customers": (db.customers, ["name", "phone", "email", "city", "state", "orders", "spent", "type"]), "products": (db.products, ["sku", "name", "category", "selling_price", "cost_price", "stock", "production_method", "status"]), "orders": (db.orders, ["id", "customer_name", "product_name", "sku", "total", "amount_paid", "payment_status", "status", "created_at"])}
+    if kind not in configs: raise HTTPException(400, "Export supports customers, products, and orders")
+    collection, fields = configs[kind]; rows = await collection.find({}, {"_id": 0}).to_list(1000); stream = io.StringIO(); writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore"); writer.writeheader(); writer.writerows(rows)
+    return StreamingResponse(iter([stream.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=paperbow-{kind}.csv"})
+
+@api.post("/import/{kind}")
+async def import_csv(kind: str, file: UploadFile = File(...), user=Depends(current_user)):
+    if kind not in {"customers", "products", "orders"}: raise HTTPException(400, "Import supports customers, products, and orders")
+    try: rows = list(csv.DictReader((await file.read()).decode("utf-8-sig").splitlines()))
+    except Exception: raise HTTPException(400, "Upload a valid UTF-8 CSV file")
+    if not rows: raise HTTPException(400, "CSV has no rows")
+    required = {"customers": ["name", "phone"], "products": ["sku", "name", "category", "selling_price"], "orders": ["id", "customer_name", "total"]}[kind]
+    errors = [{"row": i + 2, "missing": [x for x in required if not row.get(x)]} for i, row in enumerate(rows) if any(not row.get(x) for x in required)]
+    if errors: return {"status": "needs_review", "total": len(rows), "valid": len(rows)-len(errors), "errors": errors[:25]}
+    collection = getattr(db, kind)
+    inserted = 0; skipped = 0
+    unique_field = {"customers": "phone", "products": "sku", "orders": "id"}[kind]
+    for row in rows:
+        if await collection.find_one({unique_field: row[unique_field]}): skipped += 1; continue
+        if kind == "customers": row.update({"orders": 0, "spent": 0, "type": "New", "archived": False})
+        if kind == "products":
+            for field in ["selling_price", "cost_price", "stock"]:
+                if field in row: row[field] = float(row[field] or 0) if field != "stock" else int(float(row[field] or 0))
+        await collection.insert_one(row); inserted += 1
+    return {"status": "imported", "total": len(rows), "inserted": inserted, "skipped_duplicates": skipped}
 
 @api.get("/search")
 async def search(q: str, user=Depends(current_user)):
