@@ -162,12 +162,22 @@ class ProductIn(BaseModel):
     production_method: str = "Sublimation"
     status: str = "Active"
 
-class OrderIn(BaseModel):
-    customer_id: str
+class OrderItemIn(BaseModel):
     product_id: str
     quantity: int = Field(default=1, ge=1)
     customization: str = ""
+    discount: float = 0
+    tax_rate: float = 0  # percent, e.g. 18 for 18%
+
+class OrderIn(BaseModel):
+    customer_id: str
+    items: List[OrderItemIn] = []
+    # legacy single-item fields (still accepted)
+    product_id: Optional[str] = None
+    quantity: int = 1
+    customization: str = ""
     channel: str = "WhatsApp"
+    shipping_cost: float = 0
     payment_method: str = "UPI"
     amount_paid: float = 0
     priority: str = "Normal"
@@ -360,37 +370,80 @@ async def orders(search: str = "", status: str = "All", user=Depends(current_use
 async def create_order(body: OrderIn, user=Depends(current_user)):
     try:
         customer = await db.customers.find_one({"_id": ObjectId(body.customer_id)})
-        product = await db.products.find_one({"_id": ObjectId(body.product_id)})
     except Exception:
-        raise HTTPException(400, "Invalid customer or product id")
-    if not customer or not product:
-        raise HTTPException(404, "Customer or product not found")
+        raise HTTPException(400, "Invalid customer id")
+    if not customer:
+        raise HTTPException(404, "Customer not found")
+    items_in = list(body.items) if body.items else []
+    if not items_in and body.product_id:
+        items_in = [OrderItemIn(product_id=body.product_id, quantity=body.quantity,
+                                customization=body.customization)]
+    if not items_in:
+        raise HTTPException(400, "Add at least one product to the order")
+    built_items = []
+    subtotal = 0.0
+    tax_total = 0.0
+    for it in items_in:
+        try:
+            product = await db.products.find_one({"_id": ObjectId(it.product_id)})
+        except Exception:
+            raise HTTPException(400, f"Invalid product id {it.product_id}")
+        if not product:
+            raise HTTPException(404, "Product not found")
+        unit_price = float(product["selling_price"])
+        gross = max(unit_price * it.quantity - float(it.discount or 0), 0)
+        tax = round(gross * float(it.tax_rate or 0) / 100, 2)
+        line_total = round(gross + tax, 2)
+        subtotal += gross
+        tax_total += tax
+        built_items.append({
+            "product_id": it.product_id,
+            "sku": product["sku"],
+            "product_name": product["name"],
+            "quantity": it.quantity,
+            "unit_price": unit_price,
+            "customization": it.customization,
+            "discount": float(it.discount or 0),
+            "tax_rate": float(it.tax_rate or 0),
+            "tax": tax,
+            "line_total": line_total,
+        })
+    shipping_cost = float(body.shipping_cost or 0)
+    total = round(subtotal + tax_total + shipping_cost, 2)
+    paid = min(max(float(body.amount_paid or 0), 0), total)
+    payment_status = "Paid" if paid >= total else ("Partially Paid" if paid else "Pending")
     count = await db.orders.count_documents({}) + 1
     order_id = f"PB-{datetime.now().year}-{count:04d}"
-    total = body.quantity * float(product["selling_price"])
-    paid = min(max(body.amount_paid, 0), total)
-    payment_status = "Paid" if paid >= total else ("Partially Paid" if paid else "Pending")
+    first = built_items[0]
     doc = {
         "id": order_id,
         "customer_id": body.customer_id,
         "customer_name": customer["name"],
-        "product_id": body.product_id,
-        "product_name": product["name"],
-        "sku": product["sku"],
-        "quantity": body.quantity,
-        "customization": body.customization,
-        "channel": body.channel,
-        "priority": body.priority,
+        "customer_phone": customer.get("phone", ""),
+        "customer_email": customer.get("email", ""),
+        "items": built_items,
+        # legacy mirrors so existing table/CSV columns keep working
+        "product_id": first["product_id"],
+        "product_name": first["product_name"] if len(built_items) == 1 else f"{len(built_items)} items",
+        "sku": first["sku"],
+        "quantity": sum(i["quantity"] for i in built_items),
+        "customization": first["customization"],
+        "subtotal": round(subtotal, 2),
+        "shipping_cost": shipping_cost,
+        "tax": round(tax_total, 2),
         "total": total,
         "amount_paid": paid,
-        "pending": total - paid,
+        "pending": round(total - paid, 2),
         "payment_method": body.payment_method,
         "payment_status": payment_status,
+        "channel": body.channel,
+        "priority": body.priority,
         "status": "Confirmed",
         "production_status": "Waiting",
         "shipping_status": "Not Ready",
         "created_at": now(),
-        "timeline": [{"event": "Order created", "date": now(), "user": user["name"]}],
+        "timeline": [{"event": "Order created", "date": now(), "user": user["name"],
+                      "notes": f"{len(built_items)} item(s) · ₹{total:,.0f}"}],
     }
     await db.orders.insert_one(doc)
     await db.customers.update_one(
@@ -404,6 +457,17 @@ async def order_detail(order_id: str, user=Depends(current_user)):
     order = await db.orders.find_one({"id": order_id}, {"_id": 0})
     if not order:
         raise HTTPException(404, "Order not found")
+    if not order.get("customer_phone") and order.get("customer_id"):
+        try:
+            cust = await db.customers.find_one(
+                {"_id": ObjectId(order["customer_id"])},
+                {"phone": 1, "email": 1},
+            )
+            if cust:
+                order["customer_phone"] = cust.get("phone", "")
+                order["customer_email"] = cust.get("email", "")
+        except Exception:
+            pass
     order["files"] = await db.files.find(
         {"order_id": order_id, "is_deleted": False}, {"_id": 0}
     ).sort("created_at", -1).to_list(100)
